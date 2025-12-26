@@ -1,0 +1,205 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Benevolent Bandwidth Foundation</title>
+    <style>
+        /* --- MODERN, CLEAN, NON-TECHY STYLING --- */
+        :root {
+            --primary: #2C3E50; /* Deep Blue */
+            --accent: #E67E22;  /* Warm Orange */
+            --bg: #FAFAFA;      /* Off-White */
+            --text: #333;
+        }
+
+        body {
+            font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif;
+            line-height: 1.6;
+            color: var(--text);
+            background-color: var(--bg);
+            margin: 0;
+            padding: 0;
+        }
+
+        /* Hero Section */
+        .hero {
+            background-color: #fff;
+            padding: 80px 20px;
+            text-align: center;
+            border-bottom: 1px solid #eee;
+        }
+
+        /* Logo Styling */
+        .hero-logo {
+            max-width: 180px; 
+            height: auto;
+            margin-bottom: 30px;
+            display: inline-block;
+        }
+
+        h1 {
+            font-size: 3rem;
+            margin-bottom: 10px;
+            color: var(--primary);
+            font-weight: 700;
+        }
+
+        .subtitle {
+            font-size: 1.5rem;
+            color: #666;
+            font-weight: 300;
+            max-width: 600px;
+            margin: 0 auto 40px auto;
+        }
+
+        /* Buttons */
+        .btn {
+            display: inline-block;
+            padding: 15px 30px;
+            border-radius: 50px;
+            text-decoration: none;
+            font-weight: bold;
+            transition: all 0.3s ease;
+            margin: 10px;
+        }
+
+        .btn-primary {
+            background-color: var(--primary);
+            color: #fff;
+        }
+
+        .btn-primary:hover {
+            background-color: #1a252f;
+            transform: translateY(-2px);
+        }
+
+        .btn-outline {
+            border: 2px solid var(--primary);
+            color: var(--primary);
+        }
+
+        .btn-outline:hover {
+            background-color: var(--primary);
+            color: #fff;
+        }
+
+        /* Content Sections */
+        .container {
+            max-width: 900px;
+            margin: 0 auto;
+            padding: 60px 20px;
+        }
+
+        .section-title {
+            text-align: center;
+            font-size: 2rem;
+            margin-bottom: 40px;
+            color: var(--primary);
+        }
+
+        .card-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 30px;
+        }
+
+        .card {
+            background: #fff;
+            padding: 30px;
+            border-radius: 12px;
+            box-shadow: 0 4px 15px rgba(0,0,0,0.05);
+            transition: transform 0.2s;
+        }
+
+        .card:hover {
+            transform: translateY(-5px);
+        }
+
+        .card h3 {
+            color: var(--accent);
+            margin-top: 0;
+        }
+
+        /* Principles List */
+        .principles-list {
+            list-style: none;
+            padding: 0;
+        }
+
+        .principles-list li {
+            padding: 15px 0;
+            border-bottom: 1px solid #eee;
+            font-size: 1.1rem;
+        }
+
+        .principles-list li:last-child {
+            border-bottom: none;
+        }
+
+        footer {
+            background-color: var(--primary);
+            color: #fff;
+            text-align: center;
+            padding: 40px 20px;
+            margin-top: 60px;
+        }
+        
+        footer a { color: #fff; text-decoration: underline; }
+
+    </style>
+</head>
+<body>
+
+    <!-- HERO SECTION -->
+    <div class="hero">
+        
+        <!-- IMAGE LOGO -->
+        <!-- Ensure you upload 'logo.png' to your repository folder -->
+        <img src="logo.png" alt="Benevolent Bandwidth Logo" class="hero-logo">
+        
+        <h1>The Benevolent Bandwidth Foundation (b2)</h1>
+        <p class="subtitle">A global community building safe, open-source AI tools for the public benefit.</p>
+        
+        <div>
+            <a href="https://research-aiagent.streamlit.app/" class="btn btn-primary" target="_blank">Try Our First Tool</a>
+            <a href="https://github.com/benevolentbandwidth/researchagent" class="btn btn-outline" target="_blank">View on GitHub</a>
+        </div>
+    </div>
+
+    <!-- MISSION SECTION -->
+    <div class="container">
+        <h2 class="section-title">Our Mission</h2>
+        <p style="text-align: center; font-size: 1.2rem; line-height: 1.8;">
+            We solve problems with tech and AI that deliver public benefit, prioritize safety and fairness, 
+            <strong>without collecting any personal user data.</strong><br><br>
+            We envision a future where AI serves all of humanity through an open ecosystem 
+            of trustworthy tools that improve real lives.
+        </p>
+    </div>
+
+    <!-- CORE PRINCIPLES -->
+    <div class="container" style="background-color: #fff; border-radius: 12px; padding: 60px; box-shadow: 0 4px 15px rgba(0,0,0,0.05);">
+        <h2 class="section-title">The b2 Principles</h2>
+        <ul class="principles-list">
+            <li>🛠️ <strong>Problem First:</strong> We start with the problem not the solution or technology and build useful tools that are practical, usable, and easy to adopt.</li>
+            <li>🛡️ <strong>Privacy First:</strong> We never collect personal data, track users, or render ads.</li>
+            <li>🤝 <strong>Public Benefit:</strong> We prioritize safety over speed and focus on real-world impact.</li>
+            <li>📖 <strong>Open Source:</strong> Our code, docs, and decisions are transparent by default.</li>
+            <li>⚖️ <strong>Neutrality:</strong> We do not support political agendas or partisan positions.</li>
+            <li>🌱 <strong>Community:</strong> We are humble, inclusive, and we stand on each other's shoulders.</li>
+        </ul>
+        <div style="text-align: center; margin-top: 40px;">
+            <a href="https://docs.google.com/document/d/1wXAiCFc7k901R__gI42fFIm-_Ok5x-HID5bP4tAPFlE/edit?tab=t.0" target="_blank" class="btn btn-outline" style="border-width: 1px;">Read our Charter & Operating Principles</a>
+        </div>
+    </div>
+
+    <!-- FOOTER -->
+    <footer>
+        <p>&copy; 2025 The Benevolent Bandwidth Foundation.</p>
+        <p>Built with ❤️ for humanity.</p>
+    </footer>
+
+</body>
+</html>
+
