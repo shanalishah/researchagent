@@ -32,6 +32,7 @@ except ImportError:
 # Optional Google Gemini client
 try:
     from google import genai  # type: ignore
+    from google.genai import types # type: ignore
 except ImportError:
     genai = None  # type: ignore
 
@@ -39,8 +40,6 @@ except ImportError:
 # Constants
 # =========================
 
-MIN_FOR_PREDICTION = 20
-OPENAI_EMBEDDING_MODEL_NAME = "text-embedding-3-large"
 MIN_FOR_PREDICTION = 20
 OPENAI_EMBEDDING_MODEL_NAME = "text-embedding-3-large"
 GEMINI_EMBEDDING_MODEL_NAME = "text-embedding-004"
@@ -63,7 +62,7 @@ DEFAULT_MONEYBALL_WEIGHTS = {
 class LLMConfig:
     api_key: str
     model: str
-    api_base: str
+    api_base: Optional[str]
     provider: str = "openai"  # "openai", "gemini", "groq", or "free_local"
 
 
@@ -205,6 +204,41 @@ JOURNAL_KEYWORDS = [
 
 NEGATIVE_VENUE_SIGNALS = ["submitted to", "under review", "preprint"]
 
+ARXIV_CATEGORIES: Dict[str, List[str]] = {
+    # Keep it practical; you can extend anytime
+    "Computer Science": [
+        "cs.AI", "cs.LG", "cs.HC", "cs.CL", "cs.CV", "cs.RO", "cs.IR", "cs.NE", "cs.SE",
+        "cs.CR", "cs.DS", "cs.DB", "cs.SI", "cs.MM", "cs.IT", "cs.PF", "cs.MA",
+    ],
+    # "Statistics": ["stat.ML", "stat.AP", "stat.CO", "stat.TH"],
+    # "Mathematics": ["math.OC", "math.ST", "math.IT", "math.PR", "math.NA"],
+    # "Physics": ["physics.comp-ph", "physics.data-an", "physics.soc-ph", "physics.optics"],
+    # "Quantitative Biology": ["q-bio.QM", "q-bio.NC", "q-bio.BM"],
+    # "Quantitative Finance": ["q-fin.MF", "q-fin.ST", "q-fin.CP", "q-fin.TR"],
+    # "Electrical Engineering and Systems Science": ["eess.IV", "eess.SP", "eess.SY", "eess.AS"],
+    # "Economics": ["econ.EM", "econ.TH"],
+}
+
+ARXIV_CODE_TO_NAME = {
+    "cs.AI": "Artificial Intelligence",
+    "cs.LG": "Machine Learning",
+    "cs.HC": "Human-Computer Interaction",
+    "cs.CL": "Computation and Language",
+    "cs.CV": "Computer Vision and Pattern Recognition",
+    "cs.RO": "Robotics",
+    "cs.IR": "Information Retrieval",
+    "cs.NE": "Neural and Evolutionary Computing",
+    "cs.SE": "Software Engineering",
+    "cs.CR": "Cryptography and Security",
+    "cs.DS": "Data Structures and Algorithms",
+    "cs.DB": "Databases",
+    "cs.SI": "Social and Information Networks",
+    "cs.MM": "Multimedia",
+    "cs.IT": "Information Theory",
+    "cs.PF": "Performance",
+    "cs.MA": "Multiagent Systems",
+}
+
 def extract_venue(comment: str) -> Optional[str]:
     if not comment:
         return None
@@ -217,6 +251,28 @@ def extract_venue(comment: str) -> Optional[str]:
             return venue
     return None
 
+def build_arxiv_category_query(
+    main_category: str,
+    subcategories: List[str],
+) -> str:
+    """
+    Returns arXiv API query fragment like:
+      (cat:cs.AI OR cat:cs.LG OR cat:stat.ML)
+    If subcategories empty, falls back to all subcats in main_category.
+    If main_category == "All", uses all subcategories across all mains.
+    """
+    if main_category == "All":
+        cats = sorted({c for subs in ARXIV_CATEGORIES.values() for c in subs})
+    else:
+        cats = subcategories if subcategories else ARXIV_CATEGORIES.get(main_category, [])
+
+    # Safety fallback (so your app never crashes)
+    if not cats:
+        cats = ["cs.AI", "cs.LG", "cs.HC"]
+
+    return "(" + " OR ".join([f"cat:{c}" for c in cats]) + ")"
+
+
 
 # =========================
 # Robust arXiv fetching
@@ -225,11 +281,12 @@ def extract_venue(comment: str) -> Optional[str]:
 def fetch_arxiv_papers_by_date(
     start_date: date,
     end_date: date,
+    arxiv_query: Optional[str] = None,
     batch_size: int = 50,
     max_batches: int = 100,
     max_retries: int = 3,
 ) -> List[Paper]:
-    query = "(cat:cs.AI OR cat:cs.LG OR cat:cs.HC)"
+    query = arxiv_query or "(cat:cs.AI OR cat:cs.LG OR cat:cs.HC)"
     base_url = "https://export.arxiv.org/api/query"
 
     results: List[Paper] = []
@@ -329,52 +386,71 @@ def call_llm(prompt: str, llm_config: LLMConfig, label: str = "") -> str:
         st.session_state["last_prompts"] = {}
     st.session_state["last_prompts"][label or "default"] = prompt
 
-    try:
-        if llm_config.provider == "openai":
-            client = OpenAI(api_key=llm_config.api_key, base_url=llm_config.api_base)
-            messages = [
-                {"role": "system", "content": "You are a helpful AI assistant."},
-                {"role": "user", "content": prompt},
-            ]
-            kwargs: Dict[str, Any] = {"model": llm_config.model, "messages": messages}
-            
-            # Logic Update: Do NOT set temperature for o1 or ANY gpt-5 variant
-            # This covers gpt-5, gpt-5.2, gpt-5-mini, gpt-5-nano, etc.
-            if not (llm_config.model.startswith("o1") or llm_config.model.startswith("gpt-5")):
-                kwargs["temperature"] = 0.2
-            
-            resp = client.chat.completions.create(**kwargs)
-            return resp.choices[0].message.content
-
-        elif llm_config.provider == "gemini":
-            if genai is None:
-                st.error("Gemini provider selected but google-genai package is not installed.")
-                st.stop()
-            client = genai.Client(api_key=llm_config.api_key)
-            response = client.models.generate_content(
-                model=llm_config.model,
-                contents=prompt,
-            )
-            return response.text
-
-        elif llm_config.provider == "groq":
-            client = Groq(api_key=llm_config.api_key)
-            response = client.chat.completions.create(
-                model=llm_config.model,
-                messages=[
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            if llm_config.provider == "openai":
+                # Standard OpenAI init
+                client_args = {"api_key": llm_config.api_key}
+                if llm_config.api_base and llm_config.api_base.strip():
+                    client_args["base_url"] = llm_config.api_base
+                
+                client = OpenAI(**client_args)
+                
+                messages = [
                     {"role": "system", "content": "You are a helpful AI assistant."},
                     {"role": "user", "content": prompt},
-                ],
-                temperature=0.2,
-            )
-            return response.choices[0].message.content
+                ]
+                kwargs: Dict[str, Any] = {"model": llm_config.model, "messages": messages}
+                
+                if not (llm_config.model.startswith("o1") or llm_config.model.startswith("gpt-5")):
+                    kwargs["temperature"] = 0.2
+                
+                resp = client.chat.completions.create(**kwargs)
+                return resp.choices[0].message.content
 
-        else:
-            raise ValueError(f"Unknown provider: {llm_config.provider}")
+            elif llm_config.provider == "gemini":
+                if genai is None:
+                    st.error("Gemini provider selected but google-genai package is not installed.")
+                    st.stop()
+                client = genai.Client(api_key=llm_config.api_key)
+                response = client.models.generate_content(
+                    model=llm_config.model,
+                    contents=prompt,
+                )
+                
+                # Handle mixed content
+                if hasattr(response, 'candidates') and response.candidates:
+                    cand = response.candidates[0]
+                    if hasattr(cand, 'content') and hasattr(cand.content, 'parts'):
+                        texts = []
+                        for part in cand.content.parts:
+                            if hasattr(part, 'text') and part.text:
+                                texts.append(part.text)
+                        if texts:
+                            return "".join(texts)
+                return getattr(response, 'text', "")
 
-    except Exception as e:
-        st.error(f"LLM call failed ({label or 'general'}): {e}")
-        st.stop()
+            elif llm_config.provider == "groq":
+                client = Groq(api_key=llm_config.api_key)
+                response = client.chat.completions.create(
+                    model=llm_config.model,
+                    messages=[
+                        {"role": "system", "content": "You are a helpful AI assistant."},
+                        {"role": "user", "content": prompt},
+                    ],
+                    temperature=0.2,
+                )
+                return response.choices[0].message.content
+
+            else:
+                raise ValueError(f"Unknown provider: {llm_config.provider}")
+
+        except Exception as e:
+            if attempt == max_retries - 1:
+                print(f"LLM call failed ({label}): {e}")
+                raise e
+            time.sleep(2 * (attempt + 1))
 
 
 def safe_parse_json_array(raw: str) -> Optional[List[Dict[str, Any]]]:
@@ -409,18 +485,31 @@ def safe_parse_json_array(raw: str) -> Optional[List[Dict[str, Any]]]:
 
 def embed_texts_openai(texts: List[str], llm_config: LLMConfig, embedding_model: str) -> List[List[float]]:
     if not texts: return []
-    client = OpenAI(api_key=llm_config.api_key, base_url=llm_config.api_base)
+    
+    # Robust Init with Retries
+    client_args = {"api_key": llm_config.api_key}
+    if llm_config.api_base and llm_config.api_base.strip():
+        client_args["base_url"] = llm_config.api_base
+    client = OpenAI(**client_args)
+    
     all_embeddings: List[List[float]] = []
     batch_size = 100
+    
     for start in range(0, len(texts), batch_size):
         batch = texts[start:start + batch_size]
-        try:
-            resp = client.embeddings.create(model=embedding_model, input=batch)
-        except Exception as e:
-            st.error(f"Embedding API call failed: {e}")
-            raise
-        for d in resp.data:
-            all_embeddings.append(d.embedding)
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                resp = client.embeddings.create(model=embedding_model, input=batch)
+                for d in resp.data:
+                    all_embeddings.append(d.embedding)
+                break
+            except Exception as e:
+                if attempt == max_retries - 1:
+                    st.error(f"Embedding API call failed: {e}")
+                    raise
+                time.sleep(2 * (attempt + 1))
+                
     return all_embeddings
 
 
@@ -554,11 +643,17 @@ def classify_papers_with_llm(
         """).strip()
 
         prompt = "\n\n".join([instruction, "PAPERS:", *paper_blocks])
-        raw = call_llm(prompt, llm_config, label="classification")
+        
+        # Retry logic handled inside call_llm now
+        try:
+            raw = call_llm(prompt, llm_config, label="classification")
+        except:
+            raw = ""
+
         parsed = safe_parse_json_array(raw)
 
         if parsed is None:
-            st.error("Failed to parse classification JSON.")
+            # st.error("Failed to parse classification JSON.")
             continue
 
         idx_to_info = {}
@@ -605,20 +700,46 @@ def heuristic_classify_papers_free(candidates: List[Paper]) -> List[Paper]:
 # MONEYBALL Impact Scoring
 # =========================
 
-def get_s2_citation_stats(title: str, api_key: Optional[str] = None) -> int:
+def get_s2_citation_stats(paper: Paper, api_key: Optional[str] = None) -> int:
     """Queries Semantic Scholar to find the max author citations."""
     headers = {"x-api-key": api_key} if api_key else {}
+    max_retries = 2 # 3 attempts total (initial + 2 retries)
+
+    def fetch(url, params):
+        for attempt in range(max_retries + 1):
+            try:
+                # INCREASED TIMEOUT TO 10
+                r = requests.get(url, headers=headers, params=params, timeout=10)
+                if r.status_code == 200:
+                    return r.json()
+                if r.status_code == 429: # Rate limit, backoff
+                     time.sleep(2 * (attempt + 1))
+                     continue
+            except:
+                 if attempt < max_retries:
+                     time.sleep(1)
+                     continue
+        return None
+    
+    # 1. Try Lookup by ArXiv ID first (More reliable)
+    if paper.arxiv_id:
+        clean_id = paper.arxiv_id.split('v')[0]
+        url = f"https://api.semanticscholar.org/graph/v1/paper/ARXIV:{clean_id}"
+        params = {"fields": "authors.citationCount"}
+        data = fetch(url, params)
+        if data:
+            auth_cites = [a.get('citationCount', 0) for a in data.get('authors', []) if a.get('citationCount')]
+            if auth_cites: return max(auth_cites)
+
+    # 2. Fallback to Title Search
     url = "https://api.semanticscholar.org/graph/v1/paper/search"
-    params = {"query": title, "limit": 1, "fields": "title,citationCount,authors.citationCount"}
-    try:
-        r = requests.get(url, headers=headers, params=params, timeout=3)
-        if r.status_code == 200:
-            data = r.json()
-            if data.get('data'):
-                paper_data = data['data'][0]
-                auth_cites = [a.get('citationCount', 0) for a in paper_data.get('authors', []) if a.get('citationCount')]
-                return max(auth_cites) if auth_cites else 0
-    except: pass
+    params = {"query": paper.title, "limit": 1, "fields": "title,citationCount,authors.citationCount"}
+    data = fetch(url, params)
+    if data and data.get('data'):
+         paper_data = data['data'][0]
+         auth_cites = [a.get('citationCount', 0) for a in paper_data.get('authors', []) if a.get('citationCount')]
+         return max(auth_cites) if auth_cites else 0
+
     return 0
 
 def predict_citations_direct(target_papers: List[Paper], llm_config: LLMConfig, batch_size: int = 8) -> List[Paper]:
@@ -636,8 +757,29 @@ def predict_citations_direct(target_papers: List[Paper], llm_config: LLMConfig, 
     
     for i, p in enumerate(target_papers):
         # 1. Get Hard Data (Fame Signal)
-        max_auth_cites = get_s2_citation_stats(p.title, s2_key)
-        h1_fame = min(math.log(max_auth_cites + 1) * 8, 95)
+        max_auth_cites = get_s2_citation_stats(p, s2_key)
+        
+        # LOGIC: Check if we have data or if the paper is too new
+        is_fresh = False
+        try:
+            # DETERMINISTIC CHECK: Purely based on date, ignoring API flakiness result
+            days_old = (datetime.now().date() - p.submitted_date.date()).days
+            if days_old <= 5: is_fresh = True
+        except: pass
+
+        if max_auth_cites > 0:
+            # We have real data -> Standard Model
+            h1_fame = min(math.log(max_auth_cites + 1) * 8, 95)
+            fame_label = "real"
+        elif is_fresh:
+            # Too New + No Data -> DO NOT SCORE
+            fame_label = "too_new"
+            h1_fame = 0.0 # Sentinel
+        else:
+            # Old + No Data -> Likely obscure
+            h1_fame = 0.0
+            fame_label = "none"
+
         if not s2_key: time.sleep(0.3) 
         
         # 2. Calculate Hype/Sniper (Python Heuristics)
@@ -653,7 +795,6 @@ def predict_citations_direct(target_papers: List[Paper], llm_config: LLMConfig, 
         if any(n in t_lower for n in niche): h3_sniper -= 20
         
         # 3. LLM Call: Get Score AND Custom Narrative
-        # We ask the LLM to write the content bullets specifically
         prompt = textwrap.dedent(f"""
             Analyze this abstract.
             1. Rate 'Citation Potential' (0-10) based on market fit (Broad/Hot = High, Niche = Low).
@@ -676,7 +817,6 @@ def predict_citations_direct(target_papers: List[Paper], llm_config: LLMConfig, 
         try:
             raw = call_llm(prompt, llm_config, label="moneyball_narrative")
             if raw:
-                # Cleanup markdown
                 if "```" in raw:
                     parts = raw.split("```json")
                     if len(parts) > 1: raw = parts[1].split("```")[0]
@@ -687,7 +827,6 @@ def predict_citations_direct(target_papers: List[Paper], llm_config: LLMConfig, 
                 
                 if "bullets" in parsed and isinstance(parsed["bullets"], list):
                     raw_list = parsed["bullets"]
-                    # Clean up any "Market Fit:" prefixes the LLM might have ignored
                     cleaned_list = []
                     for b in raw_list:
                         b = b.replace("Market Fit:", "").replace("Contribution:", "").strip()
@@ -696,26 +835,36 @@ def predict_citations_direct(target_papers: List[Paper], llm_config: LLMConfig, 
         except: pass
 
         # 4. Calculate Final Score
-        score = (h1_fame * weights['weight_fame'] + 
-                 h2_hype * weights['weight_hype'] + 
-                 h3_sniper * weights['weight_sniper'] + 
-                 h4_utility * weights['weight_utility'])
-        p.predicted_citations = score
+        if fame_label == "too_new":
+            # SENTINEL VALUE: -1.0 means "Unrated"
+            p.predicted_citations = -1.0
+        else:
+            score = (h1_fame * weights['weight_fame'] + 
+                     h2_hype * weights['weight_hype'] + 
+                     h3_sniper * weights['weight_sniper'] + 
+                     h4_utility * weights['weight_utility'])
+            p.predicted_citations = score
 
         # 5. Construct Final Narrative (3 Bullets)
         final_bullets = []
         
-        # Bullet 1: Author Context (Data-Driven)
-        if max_auth_cites > 3000:
-            final_bullets.append("🚀 **Distribution:** This work comes from a highly influential author/lab, guaranteeing immediate visibility.")
-        elif max_auth_cites > 500:
-            final_bullets.append("📢 **Reach:** The authors have a strong established track record, helping the paper stand out.")
-        elif max_auth_cites > 100:
-            final_bullets.append("📈 **Momentum:** The authors have some prior traction, but the paper will rely on its content to break out.")
+        # Bullet 1: Author Context
+        if fame_label == "real":
+            if max_auth_cites > 3000:
+                final_bullets.append("🚀 **Distribution:** High influence author/lab.")
+            elif max_auth_cites > 500:
+                final_bullets.append("📢 **Reach:** Established track record.")
+            elif max_auth_cites > 100:
+                final_bullets.append("📈 **Momentum:** Authors have prior traction.")
+            else:
+                final_bullets.append("🌱 **Emerging:** Newer authors; relies on merit.")
+        elif fame_label == "too_new":
+            final_bullets.append("🆕 **Too new for impact score:** Citation data unavailable. Ranked by relevance only.")
+            if p.semantic_reason:
+                final_bullets.append(f"✨ **Relevance Insight:** Ranked highly because: {p.semantic_reason}")
         else:
-            final_bullets.append("🌱 **Emerging:** These are newer authors, so the paper must rely entirely on its specific merit to gain traction.")
+            final_bullets.append("🌱 **Emerging:** Unknown authors.")
             
-        # Bullet 2 & 3: Content Context (LLM-Driven)
         if len(content_bullets) >= 1:
             final_bullets.append(f"🎯 **Market Fit:** {content_bullets[0]}")
         if len(content_bullets) >= 2:
@@ -758,16 +907,15 @@ def summarize_paper_plain_english(paper: Paper, llm_config: LLMConfig) -> str:
 PIPELINE_DESCRIPTION_MD = """
 #### 1. Describe what you want
 
-You write a short research brief in natural language about the kind of work you care about, and optionally what you are not interested in. If you leave both fields empty, the agent switches to a global mode and just looks for the most impactful recent cs.AI, cs.LG, and cs.HC papers overall.
+You write a short research brief in natural language about the kind of work you care about, and optionally what you are not interested in. If you leave both fields empty, the agent switches to a global mode and just looks for the most impactful recent Computer Science papers overall.
 
 #### 2. The agent fetches recent arXiv papers
 
-It fetches up to about 5000 papers from arxiv.org in the Artificial Intelligence, Machine Learning, and Human–Computer Interaction categories (`cs.AI`, `cs.LG`, and `cs.HC`) for the date range you choose. It does this carefully, respecting arXiv's API rate limits.
-
+It fetches up to about 5000 papers from arxiv.org for the date range you choose, using your selected arXiv category filters—either all categories, or a specific main category (like Computer Science) with one or more subcategories (like cs.AI, cs.LG etc.). It does this carefully, respecting arXiv's API rate limits.
 #### 3. The agent picks candidate papers
 
 - In **targeted mode**, the agent uses embeddings to measure how close each paper's title and abstract are to your brief in meaning and keeps the top 150 as candidates.
-- In **global mode**, it simply takes the most recent 150 `cs.AI`, `cs.LG`, and `cs.HC` papers as candidates.
+- In **global mode**, it simply takes the most recent 150  papers as candidates.
 
 #### The agent filters by venue (Optional)
 
@@ -792,6 +940,8 @@ The agent builds a set of papers to send to the citation impact step:
 - In **free local mode**, the agent derives a citation impact score from the relevance signals and uses that to rank papers.
 
 These scores are heuristic impact signals and are best used for ranking within this batch, not as ground truth.
+
+**Note on New Papers:** Papers less than 5 days old often lack citation data in Semantic Scholar. These are marked as **"Too new for impact score"** and ranked purely by their relevance to your query.
 
 #### 7. The agent ranks, summarizes, and saves results
 
@@ -831,7 +981,7 @@ def main():
             height=200,
             help="Describe your research interest in natural language. Focus on what the main contribution "
                  "of the papers should be. If you leave this and the next box empty, the agent will perform "
-                 "a global digest of recent cs.AI, cs.LG, and cs.HC papers."
+                 "a global digest of recent Computer Science papers."
         )
 
         not_looking_for = st.text_area(
@@ -842,8 +992,31 @@ def main():
             height=120,
         )
 
-        # --- Venue Filtering UI ---
+        #----Category selection UI-----
+        st.markdown("### 🧩 arXiv Category")
 
+        main_cat = st.selectbox(
+            "Main category",
+            list(ARXIV_CATEGORIES.keys()),
+            index=0  # default to "Computer Science"
+        )
+
+        if main_cat == "All":
+            # optional: allow multiselect of mains, but simplest is "All categories"
+            subcats = []
+            st.caption("Using all available categories.")
+        else:
+            subcats = st.multiselect(
+                "Subcategory (choose one or more)",
+                options=ARXIV_CATEGORIES[main_cat],
+                default=["cs.AI", "cs.LG", "cs.HC"] if main_cat == "Computer Science" else [],
+                format_func=lambda x: f"{ARXIV_CODE_TO_NAME.get(x, x)} ({x})",
+                help="If you choose none, we'll use ALL subcategories from the selected main category."
+            )
+        # Build query string to pass into fetch
+        arxiv_query = build_arxiv_category_query(main_cat, subcats)
+
+        # --- Venue Filtering UI ---
 
         st.markdown("### 🏷 Venue Filter")
 
@@ -874,6 +1047,8 @@ def main():
                 f"Select {selected_category.lower()}(s):",
                 options=options
             )
+
+        
 
         date_option = st.selectbox("Date Range", ["Last 3 Days", "Last Week", "Last Month"])
 
@@ -987,7 +1162,7 @@ def main():
             api_key = st.text_input("Groq API Key", type="password")
             st.caption(
                 "Groq API keys are free. No credit card needed. "
-                "Get yours at https://console.groq.com"
+                "Get yours at [https://console.groq.com](https://console.groq.com)"
             )
 
             groq_models = [
@@ -1178,24 +1353,26 @@ def main():
     save_json(os.path.join(project_folder, "config.json"), config)
 
     # 2. Fetch current papers
-    st.subheader("2. Fetch Current Papers from arXiv (cs.AI + cs.LG + cs.HC)")
+    st.subheader("2. Fetch Current Papers from arXiv according to your selected Category and Subcategory")
 
     if run_clicked or "current_papers" not in st.session_state:
-        with st.spinner("Fetching cs.AI, cs.LG, and cs.HC papers from arXiv by date window..."):
+        with st.spinner("Fetching current papers from arXiv by date window..."):
             current_papers = fetch_arxiv_papers_by_date(
                 start_date=current_start,
                 end_date=current_end,
+                arxiv_query=arxiv_query,
+
             )
         st.session_state["current_papers"] = current_papers
     else:
         current_papers = st.session_state["current_papers"]
 
     if not current_papers:
-        st.warning("No cs.AI, cs.LG, or cs.HC papers found for this date range (or arXiv stopped responding).")
+        st.warning("No papers found for this date range (or arXiv stopped responding).")
         return
 
     st.success(
-        f"Fetched {len(current_papers)} cs.AI, cs.LG, and cs.HC papers in this date range "
+        f"Fetched {len(current_papers)}  papers in this date range and Category/Subcategory Selected "
         "(before any candidate selection)."
     )
 
@@ -1470,7 +1647,7 @@ It combines four signals:
 3. **Hype Keywords:** Bonus for trending topics.
 4. **Niche Penalties:** Penalty for small fields.
 
-This approach statistically outperforms pure LLM "vibes" by 6x.
+**Note on New Papers:** Papers less than 5 days old often lack citation data in Semantic Scholar. These are marked as **"Too new for impact score"** and ranked purely by their relevance to your query.
 """)
     elif provider == "gemini":
         st.markdown("""
@@ -1508,31 +1685,29 @@ These scores are heuristic and should be used as a guide for exploration rather 
             with st.spinner("Computing heuristic citation impact scores from relevance signals..."):
                 papers_with_pred = assign_heuristic_citations_free(selected_papers)
 
-        papers_with_pred = [
-            p for p in papers_with_pred if p.predicted_citations is not None
-        ]
-        if not papers_with_pred:
-            st.error("Citation impact scoring did not produce any scores.")
-            return
+        # SEPARATE into groups by focus (Primary vs Secondary vs Others)
+        primaries = [p for p in papers_with_pred if p.focus_label == "primary"]
+        secondaries = [p for p in papers_with_pred if p.focus_label == "secondary"]
+        others = [p for p in papers_with_pred if p.focus_label not in ("primary", "secondary")]
 
-        primary_pred = [p for p in papers_with_pred if p.focus_label == "primary"]
-        secondary_pred = [p for p in papers_with_pred if p.focus_label == "secondary"]
-        others_pred = [p for p in papers_with_pred if p.focus_label not in ("primary", "secondary")]
+        # Define a helper to sort any group: Scored (High->Low) THEN Unscored (High Relevance->Low)
+        def sort_group(group: List[Paper]) -> List[Paper]:
+            scored = [p for p in group if p.predicted_citations is not None and p.predicted_citations >= 0]
+            unscored = [p for p in group if p.predicted_citations == -1.0]
+            
+            # Sort Scored by predicted_citations desc
+            scored.sort(key=lambda p: p.predicted_citations, reverse=True)
+            
+            # Sort Unscored by relevance desc
+            unscored.sort(key=lambda p: (
+                p.llm_relevance_score if p.llm_relevance_score is not None else 0.0,
+                p.semantic_relevance if p.semantic_relevance is not None else 0.0
+            ), reverse=True)
+            
+            return scored + unscored
 
-        def sort_by_pred(papers: List[Paper]) -> List[Paper]:
-            return sorted(
-                papers,
-                key=lambda p: (
-                    p.predicted_citations if p.predicted_citations is not None else 0,
-                ),
-                reverse=True,
-            )
-
-        primary_pred_sorted = sort_by_pred(primary_pred)
-        secondary_pred_sorted = sort_by_pred(secondary_pred)
-        others_pred_sorted = sort_by_pred(others_pred)
-
-        ranked_papers = primary_pred_sorted + secondary_pred_sorted + others_pred_sorted
+        ranked_papers = sort_group(primaries) + sort_group(secondaries) + sort_group(others)
+        
         st.session_state["ranked_papers"] = ranked_papers
         st.session_state["has_run_once"] = True
     else:
@@ -1547,12 +1722,17 @@ These scores are heuristic and should be used as a guide for exploration rather 
     st.subheader("7. All Selected Papers (Ranked by Citation Impact Score)")
 
     st.caption(
-        "Primary papers appear first, ranked by citation impact score, followed by secondary papers."
+        "Primary papers are ranked first (Scored → Too New), followed by Secondary papers (Scored → Too New)."
     )
 
     table_rows = []
     for rank, p in enumerate(ranked_papers, start=1):
-        pred = int(p.predicted_citations or 0)
+        pred_val = p.predicted_citations
+        if pred_val == -1.0:
+            pred_display = "Too new to rate"
+        else:
+            pred_display = str(int(pred_val or 0)) # Force string to avoid mixed-type error
+            
         focus = p.focus_label or "unknown"
         if focus == "primary":
             focus_display = "🟢 primary"
@@ -1567,7 +1747,7 @@ These scores are heuristic and should be used as a guide for exploration rather 
         table_rows.append(
             {
                 "Rank": rank,
-                "Citation impact score (1y)": pred,
+                "Citation impact score (1y)": pred_display,
                 "Focus": focus_display,
                 "Relevance score": round(llm_rel, 2),
                 "Embedding similarity": round(emb_rel, 3),
@@ -1583,7 +1763,7 @@ These scores are heuristic and should be used as a guide for exploration rather 
     if not df.empty:
         st.dataframe(
             df,
-            use_container_width=True,
+            width='stretch',
             hide_index=True,
             column_config={
                 "arXiv": st.column_config.LinkColumn(
@@ -1592,6 +1772,10 @@ These scores are heuristic and should be used as a guide for exploration rather 
                     validate="^https?://.*",
                     max_chars=100,
                     display_text="arXiv link"
+                ),
+                "Citation impact score (1y)": st.column_config.TextColumn(
+                    label="Citation impact score (1y)",
+                    help="Score or 'Too new to rate'"
                 )
             }
         )
@@ -1609,7 +1793,13 @@ These scores are heuristic and should be used as a guide for exploration rather 
 
     for rank, p in enumerate(topN, start=1):
         st.markdown(f"### #{rank}: {p.title}")
-        st.write(f"**Citation impact score (1 year):** {int(p.predicted_citations or 0)}")
+        
+        pred_val = p.predicted_citations
+        if pred_val == -1.0:
+            st.write(f"**Citation impact score (1 year):** Too new to rate")
+        else:
+            st.write(f"**Citation impact score (1 year):** {int(pred_val or 0)}")
+            
         st.write(f"**Authors:** {', '.join(p.authors) if p.authors else 'Unknown'}")
         st.markdown(f"**Venue:** {p.venue or 'N/A'}")
         st.write(f"[arXiv link]({p.arxiv_url}) | [PDF link]({p.pdf_url})")
@@ -1631,6 +1821,11 @@ These scores are heuristic and should be used as a guide for exploration rather 
                 st.write("**Why this citation impact score:**")
                 for ex in p.prediction_explanations[:3]:
                     st.write(f"- {ex}")
+                # REMOVED REDUNDANT CHECK HERE
+                # The logic inside predict_citations_direct ALREADY adds the relevance insight
+                # to prediction_explanations if score is -1.0.
+                # So we just print the list (which we did above).
+
         else:
             st.markdown("**Plain English summary:** only available in OpenAI / Gemini / Groq options")
             st.markdown("**Why this citation impact score:** only available in OpenAI / Gemini / Groq options")
@@ -1670,7 +1865,13 @@ These scores are heuristic and should be used as a guide for exploration rather 
     ]
     for rank, p in enumerate(topN, start=1):
         report_lines.append(f"## #{rank}: {p.title}")
-        report_lines.append(f"- Citation impact score (1 year): {int(p.predicted_citations or 0)}")
+        
+        pred_val = p.predicted_citations
+        if pred_val == -1.0:
+            report_lines.append(f"- Citation impact score (1 year): Too new to rate")
+        else:
+            report_lines.append(f"- Citation impact score (1 year): {int(pred_val or 0)}")
+            
         report_lines.append(f"- Authors: {', '.join(p.authors) if p.authors else 'Unknown'}")
         report_lines.append(f"- arXiv: {p.arxiv_url}")
         report_lines.append(f"- PDF: {p.pdf_url}")
@@ -1687,6 +1888,8 @@ These scores are heuristic and should be used as a guide for exploration rather 
             if p.prediction_explanations:
                 for ex in p.prediction_explanations[:3]:
                     report_lines.append(f"  - {ex}")
+                # Removed redundant check here too
+
         report_lines.append("")
         report_lines.append("Abstract:")
         report_lines.append(p.abstract)
