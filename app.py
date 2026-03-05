@@ -948,6 +948,33 @@ These scores are heuristic impact signals and are best used for ranking within t
 The agent ranks papers, always showing **primary** papers first, then secondary ones. For the top N that you choose, it shows metadata, relevance signals, and links to arXiv and the PDF. In LLM API mode it also adds plain English summaries. All artifacts and a markdown report are saved in a project folder under `~/arxiv_ai_digest_projects/project_<timestamp>`, and you can download everything as a ZIP.
 """
 
+def _bibtex_key_from_paper(p: Paper) -> str:
+    # key like: smith2026_arxiv2503.12345
+    if p.authors:
+        first = p.authors[0].split()[-1]
+        base = re.sub(r"[^A-Za-z0-9]+", "", first).lower() or "paper"
+    else:
+        base = "paper"
+    year = str(p.submitted_date.year) if p.submitted_date else "nd"
+    arx = (p.arxiv_id or "").split("v")[0].replace(".", "")
+    suffix = f"_arxiv{arx}" if arx else ""
+    return f"{base}{year}{suffix}"
+
+def generate_bibtex_from_paper(p: Paper) -> str:
+    key = _bibtex_key_from_paper(p)
+    authors = " and ".join(p.authors) if p.authors else ""
+    title = (p.title or "").replace("{", "").replace("}", "")
+    year = str(p.submitted_date.year) if p.submitted_date else ""
+    url = p.arxiv_url or p.pdf_url or ""
+    return (
+        f"@article{{{key},\n"
+        f"  title={{ {title} }},\n"
+        f"  author={{ {authors} }},\n"
+        f"  year={{ {year} }},\n"
+        f"  url={{ {url} }}\n"
+        f"}}\n"
+    )
+
 
 def main():
     st.set_page_config(
@@ -1812,7 +1839,26 @@ These scores are heuristic and should be used as a guide for exploration rather 
         st.write(f"**Authors:** {', '.join(p.authors) if p.authors else 'Unknown'}")
         st.markdown(f"**Venue:** {p.venue or 'N/A'}")
         st.write(f"[arXiv link]({p.arxiv_url}) | [PDF link]({p.pdf_url})")
+        bibtex = generate_bibtex_from_paper(p)
 
+        col1, col2 = st.columns([1, 3])
+
+        with col1:
+            st.download_button(
+                label="Download BibTeX",
+                data=bibtex,
+                file_name=f"{(p.arxiv_id or f'paper_{rank}')}.bib",
+                mime="text/plain",
+                key=f"bib_dl_{p.arxiv_id or rank}",
+            )
+
+        with col2:
+            st.text_area(
+                "BibTeX (copy)",
+                value=bibtex,
+                height=140,
+                key=f"bib_txt_{p.arxiv_id or rank}",
+            )
         if provider in ("openai", "gemini", "groq"):
             paper_key = p.arxiv_id or p.title
             if paper_key in plain_summaries:
