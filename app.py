@@ -949,20 +949,31 @@ The agent ranks papers, always showing **primary** papers first, then secondary 
 """
 
 # footer
+# def render_footer():
+#     st.markdown(
+#         """
+#         <style>
+#         .custom-footer {
+#             margin-top: 70vh;
+#             text-align: center;
+#             color: gray;
+#             font-size: 0.9rem;
+#             padding-top: 20px;
+#             padding-bottom: 10px;
+#         }
+#         </style>
+
+#         <div class="custom-footer">
+#             © The Benevolent Bandwidth Foundation, Inc. · Massachusetts Nonprofit Corporation. All rights reserved.<br>
+#             Built with ❤️ for humanity
+#         </div>
+#         """,
+#         unsafe_allow_html=True,
+#     )
+
 def render_footer():
     st.markdown(
         """
-        <style>
-        .custom-footer {
-            margin-top: 70vh;
-            text-align: center;
-            color: gray;
-            font-size: 0.9rem;
-            padding-top: 20px;
-            padding-bottom: 10px;
-        }
-        </style>
-
         <div class="custom-footer">
             © The Benevolent Bandwidth Foundation, Inc. · Massachusetts Nonprofit Corporation. All rights reserved.<br>
             Built with ❤️ for humanity
@@ -977,6 +988,32 @@ def main():
         layout="wide",
     )
 
+# Footer layout fix
+    st.markdown("""
+    <style>
+
+    [data-testid="stAppViewContainer"] {
+        display: flex;
+        flex-direction: column;
+        min-height: 100vh;
+    }
+
+    [data-testid="stAppViewContainer"] > .main {
+        flex: 1;
+    }
+
+    .custom-footer {
+        text-align: center;
+        color: #6b7280;
+        font-size: 0.85rem;
+        padding: 18px 0 8px 0;
+        border-top: 1px solid #e5e7eb;
+    }
+
+    </style>
+    """, unsafe_allow_html=True)
+
+    st.title("🔎 Research Agent")
     st.title("🔎 Research Agent")
 
     
