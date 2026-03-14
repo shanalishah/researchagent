@@ -976,7 +976,7 @@ def main():
             color: gray;
             font-size: 0.85rem;
             padding: 2rem 0 1rem 0;
-            border-top: 1px solid #333;
+            border-top: none;
             margin-top: auto;
         }
         </style>
