@@ -540,6 +540,85 @@ def get_local_embed_model() -> SentenceTransformer:
     return SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
 
 
+# =========================
+# Pre-built corpus index (Task 5 — Issue #2)
+# =========================
+
+@st.cache_resource(show_spinner=False)
+def load_corpus_index():
+    """
+    Load the pre-built FAISS index, id_map, and corpus DB once per Streamlit
+    process.  Falls back gracefully if the index files are absent — the caller
+    will use the live arXiv fetch path instead.
+
+    Returns: (index, id_map, conn, model)  or  (None, None, None, None)
+    """
+    import faiss as _faiss
+    import json as _json
+    import sqlite3 as _sq
+
+    base = "data_pipeline"
+    faiss_path = os.path.join(base, "index_minilm.faiss")
+    if not os.path.exists(faiss_path):
+        return None, None, None, None
+
+    index  = _faiss.read_index(faiss_path)
+    id_map = _json.load(open(os.path.join(base, "id_map.json"), encoding="utf-8"))
+    conn   = _sq.connect(os.path.join(base, "corpus.db"), check_same_thread=False)
+    model  = get_local_embed_model()
+    return index, id_map, conn, model
+
+
+def query_index_for_papers(query_brief: str, max_candidates: int = 150) -> List[Paper]:
+    """
+    Vector-search the pre-built FAISS index and return matching Paper objects.
+    Returns [] if the index is not present — caller falls back to arXiv fetch.
+    """
+    import sqlite3 as _sq
+
+    index, id_map, conn, model = load_corpus_index()
+    if index is None:
+        return []
+
+    import numpy as _np
+    q_vec = model.encode(
+        [query_brief],
+        convert_to_numpy=True,
+        normalize_embeddings=True,
+    ).astype("float32")
+    _, I = index.search(q_vec, max_candidates)
+
+    arxiv_ids = [id_map[str(i)] for i in I[0] if i >= 0 and str(i) in id_map]
+    if not arxiv_ids:
+        return []
+
+    placeholders = ",".join("?" * len(arxiv_ids))
+    conn.row_factory = _sq.Row
+    rows = conn.execute(
+        f"SELECT * FROM papers WHERE arxiv_id IN ({placeholders})", arxiv_ids
+    ).fetchall()
+
+    papers: List[Paper] = []
+    for r in rows:
+        d = dict(r)
+        date_str = d.get("submitted_date", "2024-01-01")
+        # Handle both "YYYY-MM-DD" and full ISO strings
+        if "T" not in date_str:
+            date_str = date_str + "T00:00:00"
+        papers.append(Paper(
+            arxiv_id=d["arxiv_id"],
+            title=d["title"],
+            authors=json.loads(d.get("authors") or "[]"),
+            email_domains=[],
+            abstract=d.get("abstract") or "",
+            submitted_date=datetime.fromisoformat(date_str),
+            pdf_url=d.get("pdf_url") or "",
+            arxiv_url=d.get("arxiv_url") or "",
+            venue=d.get("venue"),
+        ))
+    return papers
+
+
 def embed_texts_local(texts: List[str]) -> List[List[float]]:
     if not texts: return []
     try:
@@ -1398,17 +1477,38 @@ def _main_body():
     st.session_state["config"] = config
     save_json(os.path.join(project_folder, "config.json"), config)
 
-    # 2. Fetch current papers
-    st.subheader("2. Fetch Current Papers from arXiv according to your selected Category and Subcategory")
+    # 2. Fetch current papers (index-first, arXiv fallback)
+    st.subheader("2. Fetch Current Papers")
 
     if run_clicked or "current_papers" not in st.session_state:
-        with st.spinner("Fetching current papers from arXiv by date window..."):
-            current_papers = fetch_arxiv_papers_by_date(
-                start_date=current_start,
-                end_date=current_end,
-                arxiv_query=arxiv_query,
+        # --- Primary path: pre-built FAISS index ---
+        with st.spinner("Loading papers from pre-built index..."):
+            index_papers = query_index_for_papers(query_brief, max_candidates=500)
 
+        if index_papers:
+            current_papers = index_papers
+            st.success(
+                f"Loaded {len(current_papers)} papers from pre-built index "
+                "(sub-second retrieval)."
             )
+        else:
+            # --- Fallback: live arXiv fetch (index absent or empty) ---
+            st.info(
+                "Pre-built index not found or returned no results — "
+                "falling back to live arXiv fetch (may take several minutes)."
+            )
+            with st.spinner("Fetching current papers from arXiv by date window..."):
+                current_papers = fetch_arxiv_papers_by_date(
+                    start_date=current_start,
+                    end_date=current_end,
+                    arxiv_query=arxiv_query,
+                )
+            if current_papers:
+                st.success(
+                    f"Fetched {len(current_papers)} papers in this date range "
+                    "and Category/Subcategory selected (before any candidate selection)."
+                )
+
         st.session_state["current_papers"] = current_papers
     else:
         current_papers = st.session_state["current_papers"]
@@ -1417,24 +1517,15 @@ def _main_body():
         st.warning("No papers found for this date range (or arXiv stopped responding).")
         return
 
-    st.success(
-        f"Fetched {len(current_papers)}  papers in this date range and Category/Subcategory Selected "
-        "(before any candidate selection)."
-    )
-
     # Apply NOT filter provider-agnostically
-    # NOT filter
     if not_text:
         current_papers, removed_count = filter_papers_by_not_terms(current_papers, not_text)
         st.info(f"Excluded {removed_count} papers whose title or abstract contained NOT terms.")
 
-    # DO NOT apply venue filter here.
-    # Save the venue settings for later use after embeddings.
+    # Save venue settings for use after embeddings (no early filter — avoids blinding the model).
     st.session_state["venue_filter_type"] = venue_filter_type
     st.session_state["selected_category"] = selected_category
     st.session_state["selected_venues"] = selected_venues
-
-    # 🔴 DELETED EARLY FILTER: Logic moved to AFTER embeddings to prevent blinding the model.
 
     st.session_state["current_papers"] = current_papers
 
