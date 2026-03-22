@@ -22,6 +22,7 @@ class PaperRecord:
     pdf_url: str
     arxiv_url: str
     fields_of_study: List[str]
+    source: str = "Semantic Scholar"
 
 
 _DDL = """
@@ -38,6 +39,7 @@ CREATE TABLE IF NOT EXISTS papers (
     pdf_url              TEXT,
     arxiv_url            TEXT,
     fields_of_study      TEXT,
+    source               TEXT,
     ingested_at          TEXT DEFAULT (datetime('now'))
 );
 CREATE INDEX IF NOT EXISTS idx_date ON papers(submitted_date);
@@ -49,6 +51,13 @@ def create_db(db_path: str) -> sqlite3.Connection:
     """Create (or open) the corpus SQLite database and ensure schema exists."""
     conn = sqlite3.connect(db_path)
     conn.executescript(_DDL)
+    
+    # Safely inject source column if migrating from an older schema version
+    try:
+        conn.execute("ALTER TABLE papers ADD COLUMN source TEXT DEFAULT 'Semantic Scholar'")
+    except sqlite3.OperationalError:
+        pass # Column likely already exists
+        
     conn.commit()
     return conn
 
@@ -60,12 +69,20 @@ def upsert_paper(conn: sqlite3.Connection, p: PaperRecord) -> None:
         INSERT INTO papers
             (arxiv_id, s2_id, title, abstract, authors, submitted_date,
              venue, citation_count, max_author_citations, pdf_url, arxiv_url,
-             fields_of_study)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             fields_of_study, source)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(arxiv_id) DO UPDATE SET
-            citation_count       = excluded.citation_count,
-            max_author_citations = excluded.max_author_citations,
-            venue                = excluded.venue,
+            citation_count       = MAX(papers.citation_count, excluded.citation_count),
+            max_author_citations = MAX(papers.max_author_citations, excluded.max_author_citations),
+            venue                = CASE 
+                WHEN excluded.venue IS NOT NULL AND excluded.venue != 'arXiv.org' AND excluded.venue != 'ArXiv' THEN excluded.venue 
+                ELSE COALESCE(papers.venue, excluded.venue) 
+            END,
+            title                = COALESCE(excluded.title, papers.title),
+            source               = CASE 
+                WHEN papers.source = 'Semantic Scholar' OR excluded.source = 'Semantic Scholar' THEN 'Semantic Scholar'
+                ELSE excluded.source
+            END,
             ingested_at          = datetime('now')
         """,
         (
@@ -81,5 +98,6 @@ def upsert_paper(conn: sqlite3.Connection, p: PaperRecord) -> None:
             p.pdf_url,
             p.arxiv_url,
             json.dumps(p.fields_of_study),
+            p.source,
         ),
     )
