@@ -83,6 +83,7 @@ class Paper:
     focus_label: Optional[str] = None
     llm_relevance_score: Optional[float] = None
     venue: Optional[str] = None
+    source: Optional[str] = None
 
 
 # =========================
@@ -272,109 +273,74 @@ def build_arxiv_category_query(
 
     return "(" + " OR ".join([f"cat:{c}" for c in cats]) + ")"
 
-
-
-# =========================
-# Robust arXiv fetching
-# =========================
-
-def fetch_arxiv_papers_by_date(
+def fetch_papers_from_db(
     start_date: date,
     end_date: date,
-    arxiv_query: Optional[str] = None,
-    batch_size: int = 50,
-    max_batches: int = 100,
-    max_retries: int = 3,
+    category_filter: Optional[str] = None,
+    subcats: Optional[List[str]] = None
 ) -> List[Paper]:
-    query = arxiv_query or "(cat:cs.AI OR cat:cs.LG OR cat:cs.HC)"
-    base_url = "https://export.arxiv.org/api/query"
+    """
+    Fetch papers from the local SQLite 20k corpus.
+    Filters by submitted_date range, and optionally checks abstract/title
+    for subcategory keyword matches to simulate arXiv category filtering.
+    """
+    import os
+    import json
+    import sqlite3 as _sq
+    db_path = "data_pipeline/corpus.db"
+    if not os.path.exists(db_path):
+        return []
 
-    results: List[Paper] = []
-    seen_ids = set()
-    start_index = 0
+    conn = _sq.connect(db_path, check_same_thread=False)
+    conn.row_factory = _sq.Row
+    
+    query = "SELECT * FROM papers WHERE date(submitted_date) >= date(?) AND date(submitted_date) <= date(?)"
+    params = [start_date.isoformat(), end_date.isoformat()]
+    
+    if category_filter and category_filter != "All":
+        query += " AND fields_of_study LIKE ?"
+        params.append(f"%{category_filter}%")
 
-    for _ in range(max_batches):
-        params = {
-            "search_query": query,
-            "start": start_index,
-            "max_results": batch_size,
-            "sortBy": "submittedDate",
-            "sortOrder": "descending",
-        }
+    if subcats and category_filter != "All":
+        or_clauses = []
+        for cat_code in subcats:
+            cat_name = ARXIV_CODE_TO_NAME.get(cat_code, cat_code)
+            # Remove minor stop words for better partial match
+            words = [w for w in cat_name.split() if w.lower() not in ('and', 'or', 'of')]
+            if words:
+                keyword = words[0]
+                if len(words) > 1:
+                    keyword = " ".join(words[:2]) # e.g. "Artificial Intelligence"
+                
+                # Check for either standard keyword simulation OR absolute 100% precision raw arXiv tag
+                or_clauses.append("(title LIKE ? OR abstract LIKE ? OR fields_of_study LIKE ?)")
+                params.extend([f"%{keyword}%", f"%{keyword}%", f"%{cat_code}%"])
+                
+        if or_clauses:
+            query += " AND (" + " OR ".join(or_clauses) + ")"
+        
+    rows = conn.execute(query, params).fetchall()
 
-        retries = 0
-        while True:
-            try:
-                response = requests.get(base_url, params=params, timeout=60)
-            except requests.RequestException as e:
-                st.error(f"Network error while calling arXiv: {e}")
-                return results
-
-            if response.status_code == 429:
-                retries += 1
-                if retries > max_retries:
-                    st.error("arXiv returned HTTP 429 (rate limit) repeatedly.")
-                    return results
-                wait_seconds = 30 * retries
-                st.warning(f"arXiv rate limit. Waiting {wait_seconds} seconds...")
-                time.sleep(wait_seconds)
-                continue
-
-            try:
-                response.raise_for_status()
-            except requests.HTTPError as e:
-                st.error(f"Error fetching from arXiv: {e}")
-                return results
-            break
-
-        feed = feedparser.parse(response.text)
-        if not feed.entries:
-            break
-
-        for entry in feed.entries:
-            published_str = entry.get("published", "")
-            if not published_str: continue
-            published_dt = datetime.fromisoformat(published_str.replace("Z", "+00:00"))
-            published_date = published_dt.date()
-
-            if published_date < start_date:
-                return results
-
-            arxiv_id = entry.get("id", "").split("/")[-1]
-            if arxiv_id in seen_ids:
-                continue
-            seen_ids.add(arxiv_id)
-
-            authors = [a.name for a in entry.authors] if "authors" in entry else []
-            email_domains: List[str] = []
-            pdf_url = ""
-            arxiv_url = entry.get("id", "")
-            for link in entry.links:
-                if link.rel == "alternate":
-                    arxiv_url = link.href
-                if getattr(link, "title", "") == "pdf":
-                    pdf_url = link.href
-
-            comment = entry.get("arxiv_comment", "") or entry.get("comment", "")
-            venue = extract_venue(comment)
-
-            paper = Paper(
-                arxiv_id=arxiv_id,
-                title=entry.title.strip().replace("\n", " "),
-                authors=authors,
-                email_domains=email_domains,
-                abstract=entry.summary.strip().replace("\n", " "),
-                submitted_date=published_dt,
-                pdf_url=pdf_url,
-                arxiv_url=arxiv_url,
-                venue=venue,
-            )
-            results.append(paper)
-
-        start_index += batch_size
-        time.sleep(3.0)
-
-    return results
+    papers: List[Paper] = []
+    for r in rows:
+        d = dict(r)
+        date_str = d.get("submitted_date", "2024-01-01")
+        if "T" not in date_str:
+            date_str = date_str + "T00:00:00"
+            
+        papers.append(Paper(
+            arxiv_id=d["arxiv_id"],
+            title=d["title"],
+            authors=json.loads(d.get("authors") or "[]"),
+            email_domains=[],
+            abstract=d.get("abstract") or "",
+            submitted_date=datetime.fromisoformat(date_str.replace("Z", "+00:00")),
+            pdf_url=d.get("pdf_url") or "",
+            arxiv_url=d.get("arxiv_url") or "",
+            venue=d.get("venue"),
+            source=d.get("source"),
+        ))
+    return papers
 
 
 # =========================
@@ -539,84 +505,6 @@ def get_local_embed_model() -> SentenceTransformer:
         raise RuntimeError("sentence-transformers is not installed.")
     return SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
 
-
-# =========================
-# Pre-built corpus index (Task 5 — Issue #2)
-# =========================
-
-@st.cache_resource(show_spinner=False)
-def load_corpus_index():
-    """
-    Load the pre-built FAISS index, id_map, and corpus DB once per Streamlit
-    process.  Falls back gracefully if the index files are absent — the caller
-    will use the live arXiv fetch path instead.
-
-    Returns: (index, id_map, conn, model)  or  (None, None, None, None)
-    """
-    import faiss as _faiss
-    import json as _json
-    import sqlite3 as _sq
-
-    base = "data_pipeline"
-    faiss_path = os.path.join(base, "index_minilm.faiss")
-    if not os.path.exists(faiss_path):
-        return None, None, None, None
-
-    index  = _faiss.read_index(faiss_path)
-    id_map = _json.load(open(os.path.join(base, "id_map.json"), encoding="utf-8"))
-    conn   = _sq.connect(os.path.join(base, "corpus.db"), check_same_thread=False)
-    model  = get_local_embed_model()
-    return index, id_map, conn, model
-
-
-def query_index_for_papers(query_brief: str, max_candidates: int = 150) -> List[Paper]:
-    """
-    Vector-search the pre-built FAISS index and return matching Paper objects.
-    Returns [] if the index is not present — caller falls back to arXiv fetch.
-    """
-    import sqlite3 as _sq
-
-    index, id_map, conn, model = load_corpus_index()
-    if index is None:
-        return []
-
-    import numpy as _np
-    q_vec = model.encode(
-        [query_brief],
-        convert_to_numpy=True,
-        normalize_embeddings=True,
-    ).astype("float32")
-    _, I = index.search(q_vec, max_candidates)
-
-    arxiv_ids = [id_map[str(i)] for i in I[0] if i >= 0 and str(i) in id_map]
-    if not arxiv_ids:
-        return []
-
-    placeholders = ",".join("?" * len(arxiv_ids))
-    conn.row_factory = _sq.Row
-    rows = conn.execute(
-        f"SELECT * FROM papers WHERE arxiv_id IN ({placeholders})", arxiv_ids
-    ).fetchall()
-
-    papers: List[Paper] = []
-    for r in rows:
-        d = dict(r)
-        date_str = d.get("submitted_date", "2024-01-01")
-        # Handle both "YYYY-MM-DD" and full ISO strings
-        if "T" not in date_str:
-            date_str = date_str + "T00:00:00"
-        papers.append(Paper(
-            arxiv_id=d["arxiv_id"],
-            title=d["title"],
-            authors=json.loads(d.get("authors") or "[]"),
-            email_domains=[],
-            abstract=d.get("abstract") or "",
-            submitted_date=datetime.fromisoformat(date_str),
-            pdf_url=d.get("pdf_url") or "",
-            arxiv_url=d.get("arxiv_url") or "",
-            venue=d.get("venue"),
-        ))
-    return papers
 
 
 def embed_texts_local(texts: List[str]) -> List[List[float]]:
@@ -1138,7 +1026,7 @@ def _main_body():
                 format_func=lambda x: f"{ARXIV_CODE_TO_NAME.get(x, x)} ({x})",
                 help="If you choose none, we'll use ALL subcategories from the selected main category."
             )
-        # Build query string to pass into fetch
+        # Build query string to pass into fetch (currently unused by SQL, available for expansions)
         arxiv_query = build_arxiv_category_query(main_cat, subcats)
 
         # --- Venue Filtering UI ---
@@ -1364,6 +1252,8 @@ def _main_body():
         "venue_filter_type": venue_filter_type,
         "selected_category": selected_category,
         "selected_venues": selected_venues,
+        "main_cat": main_cat,
+        "subcats": subcats,
     }
 
     if "last_params" not in st.session_state:
@@ -1477,44 +1367,48 @@ def _main_body():
     st.session_state["config"] = config
     save_json(os.path.join(project_folder, "config.json"), config)
 
-    # 2. Fetch current papers (index-first, arXiv fallback)
-    st.subheader("2. Fetch Current Papers")
+    # 2. Fetch current papers from local corpus
+    st.subheader("2. Fetch Current Papers from Corpus")
 
     if run_clicked or "current_papers" not in st.session_state:
-        # --- Primary path: pre-built FAISS index ---
-        with st.spinner("Loading papers from pre-built index..."):
-            index_papers = query_index_for_papers(query_brief, max_candidates=500)
+        # --- Primary path: local SQLite corpus ---
+        with st.spinner("Loading papers from local SQLite corpus by date window..."):
+            current_papers = fetch_papers_from_db(
+                start_date=current_start,
+                end_date=current_end,
+                category_filter=st.session_state.get("last_params", {}).get("main_cat", None),
+                subcats=st.session_state.get("last_params", {}).get("subcats", None)
+            )
 
-        if index_papers:
-            current_papers = index_papers
-            st.success(
-                f"Loaded {len(current_papers)} papers from pre-built index "
-                "(sub-second retrieval)."
-            )
+        if current_papers:
+            st.success(f"Loaded {len(current_papers)} papers from local corpus in this date range.")
         else:
-            # --- Fallback: live arXiv fetch (index absent or empty) ---
+            st.info("No papers found in local corpus for this specific date range.")
+
+        # Apply venue filtering IMMEDIATELY
+        before_v = len(current_papers)
+        current_papers = filter_papers_by_venue(
+            current_papers,
+            venue_filter_type,
+            selected_category,
+            selected_venues
+        )
+        after_v = len(current_papers)
+        
+        if venue_filter_type != "None":
+            display_sel = ", ".join(selected_venues) if selected_venues else ""
+            name_string = f" → {display_sel}" if display_sel else ""
             st.info(
-                "Pre-built index not found or returned no results — "
-                "falling back to live arXiv fetch (may take several minutes)."
+                f"Venue filter `{venue_filter_type}` applied{name_string}. "
+                f"Remaining: {after_v} (Filtered out {before_v - after_v})"
             )
-            with st.spinner("Fetching current papers from arXiv by date window..."):
-                current_papers = fetch_arxiv_papers_by_date(
-                    start_date=current_start,
-                    end_date=current_end,
-                    arxiv_query=arxiv_query,
-                )
-            if current_papers:
-                st.success(
-                    f"Fetched {len(current_papers)} papers in this date range "
-                    "and Category/Subcategory selected (before any candidate selection)."
-                )
 
         st.session_state["current_papers"] = current_papers
     else:
         current_papers = st.session_state["current_papers"]
 
     if not current_papers:
-        st.warning("No papers found for this date range (or arXiv stopped responding).")
+        st.warning("No papers found for this date/venue combination. Please adjust filters.")
         return
 
     # Apply NOT filter provider-agnostically
@@ -1522,16 +1416,7 @@ def _main_body():
         current_papers, removed_count = filter_papers_by_not_terms(current_papers, not_text)
         st.info(f"Excluded {removed_count} papers whose title or abstract contained NOT terms.")
 
-    # Save venue settings for use after embeddings (no early filter — avoids blinding the model).
-    st.session_state["venue_filter_type"] = venue_filter_type
-    st.session_state["selected_category"] = selected_category
-    st.session_state["selected_venues"] = selected_venues
-
     st.session_state["current_papers"] = current_papers
-
-    if not current_papers:
-        st.warning("All papers were filtered out. Relax filters or pick another date range.")
-        return
 
     save_json(
         os.path.join(project_folder, "current_papers_all.json"),
@@ -1575,32 +1460,6 @@ def _main_body():
             candidates = st.session_state["candidates"]
 
         st.success(f"{len(candidates)} top candidates selected by embedding similarity for further filtering.")
-
-    # Apply venue filtering AFTER embeddings ✨
-    venue_filter_type = st.session_state.get("venue_filter_type", "None")
-    selected_category = st.session_state.get("selected_category", None)
-    selected_venues = st.session_state.get("selected_venues", [])
-
-    before_v = len(candidates)
-    candidates = filter_papers_by_venue(
-        candidates,
-        venue_filter_type,
-        selected_category,
-        selected_venues
-    )
-    after_v = len(candidates)
-
-    if venue_filter_type != "None":
-        display_sel = ", ".join(selected_venues) if selected_venues else ""
-        if display_sel:
-            name_string = f" → {display_sel}"
-        else:
-            name_string = ""
-
-        st.info(
-            f"Venue filter `{venue_filter_type}` applied{name_string}. "
-            f"Remaining: {after_v} (Filtered out {before_v - after_v})"
-        )
 
     save_json(
         os.path.join(project_folder, "candidates_embedding_selected.json"),
