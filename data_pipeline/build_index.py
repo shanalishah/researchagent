@@ -9,6 +9,13 @@ import json
 import logging
 import os
 import sqlite3
+import sys
+from pathlib import Path
+
+# Ensure project root is on sys.path when run as a script
+_root = str(Path(__file__).resolve().parent.parent)
+if _root not in sys.path:
+    sys.path.insert(0, _root)
 
 import faiss
 import numpy as np
@@ -100,49 +107,117 @@ def run_index_build(
     db_path: str = "data_pipeline/corpus.db",
     output_dir: str = "data_pipeline",
     model_name: str = "sentence-transformers/all-MiniLM-L6-v2",
+    force_full: bool = False,
 ) -> None:
     """
-    Full index build pipeline:
-    1. Load papers from SQLite
-    2. Embed with SentenceTransformer
-    3. Build + save FAISS index
-    4. Build + save BM25 index
-    5. Write id_map.json (int index → arxiv_id)
+    Incremental index build pipeline:
+    1. Filter for papers where is_indexed = 0
+    2. Load existing FAISS/NPY/JSON artifacts
+    3. Embed only new papers
+    4. Append to artifacts and save
+    5. Update SQLite is_indexed = 1
+    6. Rebuild BM25 for all indexed papers
     """
-    os.makedirs(output_dir, exist_ok=True)
+    from data_pipeline.schema import create_db
 
-    papers = load_papers_from_db(db_path)
-    if not papers:
-        logger.error("No papers found — run fetch_corpus.py first")
+    os.makedirs(output_dir, exist_ok=True)
+    emb_path = os.path.join(output_dir, "embeddings_minilm.npy")
+    faiss_path = os.path.join(output_dir, "index_minilm.faiss")
+    id_map_path = os.path.join(output_dir, "id_map.json")
+
+    # Use create_db instead of direct connect to ensure columns (is_indexed) are migrated/created
+    conn = create_db(db_path)
+    conn.row_factory = sqlite3.Row
+
+    if force_full:
+        logger.info("Force-full rebuild requested. Resetting is_indexed=0 for all papers.")
+        conn.execute("UPDATE papers SET is_indexed = 0")
+        conn.commit()
+
+    # 1. Load papers that need indexing
+    new_papers_rows = conn.execute("SELECT * FROM papers WHERE is_indexed = 0").fetchall()
+    
+    if not new_papers_rows:
+        logger.info("No new papers to index.")
+        conn.close()
         return
 
-    logger.info("Building index for %d papers…", len(papers))
+    new_papers = []
+    for row in new_papers_rows:
+        d = dict(row)
+        d["authors"] = json.loads(d.get("authors") or "[]")
+        new_papers.append(d)
 
-    # Embeddings
-    embeddings = embed_papers(papers, model_name)
-    emb_path = os.path.join(output_dir, "embeddings_minilm.npy")
-    np.save(emb_path, embeddings)
-    logger.info("Embeddings: %.1f MB", embeddings.nbytes / 1e6)
+    # 2. Re-load existing artifacts or start fresh
+    has_artifacts = all(os.path.exists(p) for p in [emb_path, faiss_path, id_map_path])
+    
+    if has_artifacts and not force_full:
+        try:
+            existing_embeddings = np.load(emb_path)
+            existing_index = faiss.read_index(faiss_path)
+            with open(id_map_path, "r", encoding="utf-8") as fh:
+                id_map = json.load(fh)
+            logger.info("Loaded existing index with %d papers.", existing_index.ntotal)
+        except Exception as e:
+            logger.warning("Failed to load artifacts: %s. Starting fresh.", e)
+            existing_embeddings = None
+            existing_index = None
+            id_map = {}
+    else:
+        existing_embeddings = None
+        existing_index = None
+        id_map = {}
+        logger.info("Starting fresh index build.")
 
-    # FAISS index
-    faiss_path = os.path.join(output_dir, "index_minilm.faiss")
-    save_index(build_faiss_index(embeddings), faiss_path)
+    # 3. Embed new papers
+    logger.info("Embedding %d new papers…", len(new_papers))
+    new_embeddings = embed_papers(new_papers, model_name)
+    
+    # 4. Merge
+    if existing_embeddings is not None:
+        all_embeddings = np.vstack([existing_embeddings, new_embeddings])
+        existing_index.add(new_embeddings)
+        all_index = existing_index
+    else:
+        all_embeddings = new_embeddings
+        all_index = build_faiss_index(new_embeddings)
+    
+    # Update ID map (append new indices)
+    start_idx = len(id_map)
+    for i, p in enumerate(new_papers):
+        id_map[str(start_idx + i)] = p["arxiv_id"]
 
-    # BM25 index
-    bm25_dir = os.path.join(output_dir, "bm25_index")
-    build_bm25_index(papers, bm25_dir)
-
-    # ID map: positional index → arxiv_id
-    id_map = {str(i): p["arxiv_id"] for i, p in enumerate(papers)}
-    id_map_path = os.path.join(output_dir, "id_map.json")
+    # 5. Save all updated artifacts
+    np.save(emb_path, all_embeddings.astype("float32"))
+    faiss.write_index(all_index, faiss_path)
     with open(id_map_path, "w", encoding="utf-8") as fh:
         json.dump(id_map, fh)
+    
+    # 6. Update Database
+    logger.info("Updating database flags...")
+    for p in new_papers:
+        conn.execute("UPDATE papers SET is_indexed = 1 WHERE arxiv_id = ?", (p["arxiv_id"],))
+    conn.commit()
 
-    logger.info("Index build complete.")
+    # 7. Rebuild BM25
+    # Always rebuild from all indexed papers to maintain global IDF statistics
+    logger.info("Rebuilding BM25 index for all papers…")
+    all_papers_rows = conn.execute("SELECT * FROM papers WHERE is_indexed = 1").fetchall()
+    all_papers = []
+    for r in all_papers_rows:
+        all_papers.append(dict(r))
+    
+    bm25_dir = os.path.join(output_dir, "bm25_index")
+    build_bm25_index(all_papers, bm25_dir)
+
+    conn.close()
+    logger.info("Index update complete. Total indexed: %d", len(all_papers))
 
 
 if __name__ == "__main__":
+    import sys
     logging.basicConfig(
         level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s"
     )
-    run_index_build()
+    force = "--full" in sys.argv
+    run_index_build(force_full=force)
