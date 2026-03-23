@@ -9,6 +9,8 @@ import re
 from dataclasses import dataclass, asdict
 from datetime import datetime, timedelta, date
 from typing import List, Optional, Dict, Any
+import numpy as np
+import pathlib
 
 try:
     import streamlit as st
@@ -35,6 +37,11 @@ try:
     from google.genai import types # type: ignore
 except ImportError:
     genai = None  # type: ignore
+
+try:
+    import bm25s
+except ImportError:
+    bm25s = None
 
 # =========================
 # Constants
@@ -527,50 +534,192 @@ def cosine_similarity(vec1: List[float], vec2: List[float]) -> float:
     return dot / (math.sqrt(norm1) * math.sqrt(norm2))
 
 
-def select_embedding_candidates(
-    papers: List[Paper],
-    query_brief: str,
-    llm_config: Optional[LLMConfig],
-    embedding_model: str,
-    provider: str,
-    max_candidates: int = 150,
-) -> List[Paper]:
-    if not papers: return []
-
-    # 1) Embed the query
+@st.cache_resource(show_spinner=False)
+def load_bm25_index():
+    if not bm25s:
+        return None, None
+    base = pathlib.Path("data_pipeline")
+    bm25_path = base / "bm25_index"
+    id_map_path = base / "id_map.json"
+    if not bm25_path.exists() or not id_map_path.exists():
+        return None, None
     try:
-        if provider == "openai":
-            query_vec = embed_texts_openai([query_brief], llm_config, embedding_model)[0]
-        elif provider == "gemini":
-            query_vec = embed_texts_gemini([query_brief], llm_config, embedding_model)[0]
-        else:
-            # "free_local" OR "groq" uses local embeddings
-            query_vec = embed_texts_local([query_brief])[0]
-    except Exception:
+        retriever = bm25s.BM25.load(str(bm25_path))
+        with open(id_map_path, "r", encoding="utf-8") as f:
+            id_map = json.load(f)
+        arxiv_to_pos = {v: int(k) for k, v in id_map.items()}
+        return retriever, arxiv_to_pos
+    except Exception as e:
+        print(f"Failed to load BM25 index: {e}")
+        return None, None
+
+def bm25_recall(papers: List[Paper], query_brief: str, retriever, arxiv_to_pos: dict, n1: int = 600) -> List[Paper]:
+    if not retriever or not papers:
         return papers
-
-    # 2) Embed all papers
-    texts = [p.title + "\n\n" + p.abstract for p in papers]
+    # Build dictionary for O(1) fetch
+    paper_dict = {p.arxiv_id: p for p in papers}
+    
+    tokens = bm25s.tokenize([query_brief])
     try:
-        if provider == "openai":
-            paper_vecs = embed_texts_openai(texts, llm_config, embedding_model)
-        elif provider == "gemini":
-            paper_vecs = embed_texts_gemini(texts, llm_config, embedding_model)
-        else:
-            # "free_local" OR "groq" uses local embeddings
-            paper_vecs = embed_texts_local(texts)
-    except Exception:
+        res, scores = retriever.retrieve(tokens, k=n1)
+    except Exception as e:
+        print(f"BM25 retrieve error: {e}")
+        return papers
+    
+    positions = res[0]
+    
+    # Needs id_map inverted to map position back to arxiv_id. 
+    # But wait, we inverted the id_map to arxiv_to_pos. So we need pos_to_arxiv.
+    # Let's recreate pos_to_arxiv locally
+    pos_to_arxiv = {v: k for k, v in arxiv_to_pos.items()}
+    
+    recalled_papers = []
+    seen = set()
+    for pos in positions:
+        pos_int = int(pos)
+        arxiv_id = pos_to_arxiv.get(pos_int)
+        if arxiv_id and arxiv_id in paper_dict and arxiv_id not in seen:
+            recalled_papers.append(paper_dict[arxiv_id])
+            seen.add(arxiv_id)
+            
+    if len(recalled_papers) < 50:
+        st.info("BM25 recall found fewer than 50 intersecting papers. Skiping strict BM25 pruning.")
+        return papers
+    
+    return recalled_papers
+
+@st.cache_resource(show_spinner=False)
+def load_precomputed_embeddings():
+    base = pathlib.Path("data_pipeline")
+    emb_path = base / "embeddings_minilm.npy"
+    if not emb_path.exists():
+        return None
+    try:
+        return np.load(str(emb_path), mmap_mode='r')
+    except Exception as e:
+        print(f"Failed to load precomputed embeddings: {e}")
+        return None
+
+def minilm_vector_rerank(papers: List[Paper], query_brief: str, embeddings: Optional[np.ndarray], arxiv_to_pos: dict, n2: int = 300) -> List[Paper]:
+    if not papers: return []
+    if embeddings is None or not arxiv_to_pos:
+        # Fallback to runtime embed
+        texts = [p.title + "\n\n" + p.abstract for p in papers]
+        paper_vecs = embed_texts_local(texts)
+        q_vec = embed_texts_local([query_brief])[0]
+        scored = []
+        for p, vec in zip(papers, paper_vecs):
+            sim = cosine_similarity(q_vec, vec)
+            p.semantic_relevance = sim
+            scored.append((sim, p))
+        scored.sort(key=lambda x: x[0], reverse=True)
+        k = min(n2, len(scored))
+        return [p for _, p in scored[:k]]
+        
+    try:
+        model = get_local_embed_model()
+        q_vec = model.encode([query_brief], normalize_embeddings=True)[0]
+    except Exception as e:
+        print(f"Local query embed error: {e}")
         return papers
 
     scored = []
-    for p, vec in zip(papers, paper_vecs):
-        sim = cosine_similarity(query_vec, vec)
+    # Collect indices for batch extraction if possible, or dot product individually
+    for p in papers:
+        pos = arxiv_to_pos.get(p.arxiv_id)
+        if pos is not None and pos < embeddings.shape[0]:
+            vec = embeddings[pos]
+            sim = float(np.dot(vec, q_vec))
+        else:
+            sim = 0.0 # Paper not in index
         p.semantic_relevance = sim
         scored.append((sim, p))
-
+        
     scored.sort(key=lambda x: x[0], reverse=True)
-    k = min(max_candidates, len(scored))
+    k = min(n2, len(scored))
     return [p for _, p in scored[:k]]
+
+@st.cache_resource(show_spinner=False)
+def get_cross_encoder_model():
+    try:
+        from sentence_transformers import CrossEncoder
+        st.info("Loading CrossEncoder model for precision re-ranking (first run only)…")
+        return CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
+    except Exception as e:
+        print(f"CrossEncoder load error: {e}")
+        return None
+
+def cross_encoder_rerank(papers: List[Paper], query_brief: str, n3: int = 150) -> List[Paper]:
+    if not papers: return []
+    model = get_cross_encoder_model()
+    if not model:
+        # Fallback, just return top-N of whatever they came in as
+        return papers[:n3]
+        
+    pairs = [[query_brief, p.title + "\n\n" + p.abstract] for p in papers]
+    try:
+        scores = model.predict(pairs)
+        # normalize to 0-1 range roughly using sigmoid if we want it to look like cosine, 
+        # or just sort by raw logits for reranking.
+        # We will sort by raw logit, but we can set semantic_relevance to an arbitrary 0-1 scale.
+        
+        scored = []
+        for p, score in zip(papers, scores):
+            score_float = float(score)
+            # Sigmoid normalization for relevance
+            p.semantic_relevance = 1 / (1 + math.exp(-score_float)) 
+            scored.append((score_float, p))
+            
+        scored.sort(key=lambda x: x[0], reverse=True)
+        k = min(n3, len(scored))
+        return [p for _, p in scored[:k]]
+    except Exception as e:
+        print(f"CrossEncoder predict error: {e}")
+        return papers[:n3]
+
+
+def select_embedding_candidates(
+    papers: List[Paper],
+    query_brief: str,
+    llm_config: Optional[LLMConfig] = None,
+    embedding_model: str = "",
+    provider: str = "",
+    max_candidates: int = 150,
+) -> List[Paper]:
+    """
+    3-Stage Hybrid Search:
+    Stage 1: BM25 Lexical Recall (narrow down to Top 600)
+    Stage 2: MiniLM Vector Lookup (narrow down to Top 300)
+    Stage 3: CrossEncoder Precision Rerank (narrow down to Top 150)
+    """
+    if not papers: return []
+    
+    st.write(f"Starting 3-stage hybrid search from {len(papers)} SQLite candidates...")
+
+    # Load artifacts
+    bm25_retriever, arxiv_to_pos = load_bm25_index()
+    embeddings = load_precomputed_embeddings()
+
+    # Stage 1: BM25 Recall
+    if bm25_retriever and arxiv_to_pos:
+        st.write("⏱ Stage 1: BM25 lexical recall...")
+        stage1_papers = bm25_recall(papers, query_brief, bm25_retriever, arxiv_to_pos, n1=600)
+        st.write(f"✅ BM25 selected {len(stage1_papers)} candidates.")
+    else:
+        st.warning("BM25 index not found. Skipping Stage 1.")
+        stage1_papers = papers
+
+    # Stage 2: MiniLM Semantic Filter
+    st.write("⏱ Stage 2: MiniLM vector semantic filter...")
+    stage2_papers = minilm_vector_rerank(stage1_papers, query_brief, embeddings, arxiv_to_pos if arxiv_to_pos else {}, n2=300)
+    st.write(f"✅ Vector reranking selected {len(stage2_papers)} candidates.")
+    
+    # Stage 3: CrossEncoder Precision Rerank
+    st.write("⏱ Stage 3: Cross-Encoder precision reranking...")
+    stage3_papers = cross_encoder_rerank(stage2_papers, query_brief, n3=max_candidates)
+    st.write(f"✅ Cross-Encoder selected {len(stage3_papers)} final candidates.")
+
+    return stage3_papers
 
 
 # =========================
