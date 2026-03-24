@@ -119,6 +119,113 @@ def save_json(path: str, obj: Any):
         json.dump(obj, f, indent=2, default=str)
 
 
+def get_corpus_dir() -> pathlib.Path:
+    """Returns the writable directory for data pipeline artifacts."""
+    local_dir = pathlib.Path("data_pipeline")
+    # In Streamlit Cloud and most containers, /tmp is always writable.
+    # Check if we are running in a deployed environment or if local data_pipeline is missing/not writable.
+    is_streamlit_cloud = os.getenv("STREAMLIT_SHARING_MODE") is not None
+    if is_streamlit_cloud or not local_dir.exists():
+        return pathlib.Path("/tmp/data_pipeline")
+    return local_dir
+
+
+@st.cache_resource(show_spinner=False)
+def download_corpus_artifacts():
+    """
+    Startup sync from Cloudflare R2 with freshness check.
+    Syncs artifacts down to the local get_corpus_dir() if remote is newer.
+    """
+    import boto3
+    from concurrent.futures import ThreadPoolExecutor
+
+    # 1. Resolve credentials
+    # Use st.secrets if in Streamlit Cloud, otherwise environment variables
+    key_id = st.secrets.get("R2_ACCESS_KEY_ID") or os.getenv("R2_ACCESS_KEY_ID")
+    access_key = st.secrets.get("R2_SECRET_ACCESS_KEY") or os.getenv("R2_SECRET_ACCESS_KEY")
+    endpoint = st.secrets.get("R2_ENDPOINT") or os.getenv("R2_ENDPOINT")
+    bucket = st.secrets.get("R2_BUCKET") or os.getenv("R2_BUCKET")
+
+    if not all([key_id, access_key, endpoint, bucket]):
+        st.info("💡 R2 credentials not fully set; skipping remote corpus sync.")
+        return
+
+    corpus_dir = get_corpus_dir()
+    corpus_dir.mkdir(parents=True, exist_ok=True)
+    meta_path = corpus_dir / "build_meta.json"
+
+    try:
+        s2_client = boto3.client(
+            "s3",
+            endpoint_url=endpoint,
+            aws_access_key_id=key_id,
+            aws_secret_access_key=access_key,
+        )
+
+        # 2. Freshness Check
+        with st.spinner("Checking for fresh corpus updates on R2..."):
+            local_meta = {}
+            if meta_path.exists():
+                try:
+                    local_meta = json.load(open(meta_path, "r", encoding="utf-8"))
+                except:
+                    pass
+
+            # Download remote build_meta.json to a temp buffer
+            remote_meta_obj = s2_client.get_object(Bucket=bucket, Key="corpus/build_meta.json")
+            remote_meta = json.loads(remote_meta_obj["Body"].read().decode("utf-8"))
+
+            remote_ts = remote_meta.get("built_at", "")
+            local_ts = local_meta.get("built_at", "")
+            remote_ver = remote_meta.get("schema_version", 1)
+            local_ver = local_meta.get("schema_version", 0)
+
+            if remote_ts == local_ts and remote_ver == local_ver:
+                # No update needed
+                return
+
+        # 3. Full Download
+        st.info("🔄 Downloading fresh corpus artifacts from R2...")
+        
+        # Files to download (prefix 'corpus/' removed from bucket key during sync to app local)
+        # Note: scheduler.py pushes with prefix 'corpus/'. 
+        files = [
+            "corpus.db",
+            "index_minilm.faiss",
+            "embeddings_minilm.npy",
+            "id_map.json",
+            "build_meta.json"
+        ]
+        
+        def _download(filename):
+            dest = corpus_dir / filename
+            s2_client.download_file(bucket, f"corpus/{filename}", str(dest))
+            
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            executor.map(_download, files)
+
+        # 4. BM25 special case (recursive directory)
+        # We'll just download the index files manually for now
+        # bm25s keeps files in bm25_index/ folder
+        # For simplicity, if we need full directory sync, we'd list the bucket
+        # but here we'll just download the known ones
+        bm25_dir = corpus_dir / "bm25_index"
+        bm25_dir.mkdir(exist_ok=True)
+        
+        # We need to list objects in corpus/bm25_index/
+        response = s2_client.list_objects_v2(Bucket=bucket, Prefix="corpus/bm25_index/")
+        for obj in response.get("Contents", []):
+            key = obj["Key"]
+            filename = key.replace("corpus/bm25_index/", "")
+            if filename:
+                s2_client.download_file(bucket, key, str(bm25_dir / filename))
+
+        st.success("✅ Corpus artifacts updated successfully!")
+
+    except Exception as e:
+        st.warning(f"⚠️ Remote corpus sync failed: {e}. Falling back to local data.")
+
+
 def build_query_brief(research_brief: str, not_looking_for: str) -> str:
     research_brief = research_brief.strip()
     not_looking_for = not_looking_for.strip()
@@ -294,8 +401,8 @@ def fetch_papers_from_db(
     import os
     import json
     import sqlite3 as _sq
-    db_path = "data_pipeline/corpus.db"
-    if not os.path.exists(db_path):
+    db_path = get_corpus_dir() / "corpus.db"
+    if not db_path.exists():
         return []
 
     conn = _sq.connect(db_path, check_same_thread=False)
@@ -538,7 +645,7 @@ def cosine_similarity(vec1: List[float], vec2: List[float]) -> float:
 def load_bm25_index():
     if not bm25s:
         return None, None
-    base = pathlib.Path("data_pipeline")
+    base = get_corpus_dir()
     bm25_path = base / "bm25_index"
     id_map_path = base / "id_map.json"
     if not bm25_path.exists() or not id_map_path.exists():
@@ -590,7 +697,7 @@ def bm25_recall(papers: List[Paper], query_brief: str, retriever, arxiv_to_pos: 
 
 @st.cache_resource(show_spinner=False)
 def load_precomputed_embeddings():
-    base = pathlib.Path("data_pipeline")
+    base = get_corpus_dir()
     emb_path = base / "embeddings_minilm.npy"
     if not emb_path.exists():
         return None
@@ -1070,6 +1177,9 @@ def main():
         page_title="Research Agent",
         layout="wide",
     )
+
+    # Startup sync from Cloudflare R2
+    download_corpus_artifacts()
 
     # ===== FOOTER (injected early so no early return can skip it) =====
     # Uses CSS to push itself to the bottom of the viewport when content is short,
