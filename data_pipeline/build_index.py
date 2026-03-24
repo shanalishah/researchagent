@@ -210,6 +210,20 @@ def run_index_build(
     bm25_dir = os.path.join(output_dir, "bm25_index")
     build_bm25_index(all_papers, bm25_dir)
 
+    # 8. Write Step Metadata
+    from datetime import datetime
+    meta_path = os.path.join(output_dir, "build_meta.json")
+    meta = {
+        "built_at": datetime.utcnow().isoformat() + "Z",
+        "corpus_size": len(all_papers),
+        "faiss_ntotal": all_index.ntotal,
+        "db_size_bytes": os.path.getsize(db_path),
+        "schema_version": 1
+    }
+    with open(meta_path, "w", encoding="utf-8") as fh:
+        json.dump(meta, fh, indent=2)
+    logger.info("Metadata saved: %s", meta_path)
+
     conn.close()
     logger.info("Index update complete. Total indexed: %d", len(all_papers))
 

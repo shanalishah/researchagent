@@ -26,7 +26,8 @@ logger = logging.getLogger(__name__)
 
 
 def run() -> None:
-    """Run fetch → build sequentially; exit non-zero on any failure."""
+    """Run fetch → build → rclone sync sequentially; exit non-zero on any failure."""
+    import os
     logger.info("=== Pipeline run: %s ===", datetime.now().isoformat())
 
     steps = [
@@ -40,6 +41,36 @@ def run() -> None:
         if result.returncode != 0:
             logger.error("%s failed (exit code %d)", label, result.returncode)
             sys.exit(result.returncode)
+
+    # 3. R2 Push (Optional: if R2_BUCKET is set and rclone is installed)
+    bucket = os.getenv("R2_BUCKET")
+    remote = os.getenv("RCLONE_REMOTE", "r2")
+    
+    if bucket:
+        logger.info("--- R2 Push (rclone) ---")
+        try:
+            rclone_cmd = [
+                "rclone", "sync", "data_pipeline/", f"{remote}:{bucket}/corpus/",
+                "--include", "corpus.db",
+                "--include", "index_minilm.faiss",
+                "--include", "embeddings_minilm.npy",
+                "--include", "id_map.json",
+                "--include", "build_meta.json",
+                "--include", "bm25_index/**",
+                "--transfers", "4",
+                "--progress"
+            ]
+            # Replace --progress with --silent when not in a terminal or if you prefer less noise
+            subprocess.run(rclone_cmd, check=True)
+            logger.info("R2 Push complete.")
+        except FileNotFoundError:
+            logger.warning("rclone not found on PATH. Skipping R2 push.")
+        except subprocess.CalledProcessError as e:
+            logger.error("rclone sync failed with exit code %d", e.returncode)
+            # We don't exit non-zero here because the local build succeeded; 
+            # push failure is a distribution issue, not a build issue.
+    else:
+        logger.info("R2_BUCKET not set. Skipping R2 sync.")
 
     logger.info("=== Done ===")
 
