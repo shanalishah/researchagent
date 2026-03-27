@@ -20,7 +20,6 @@ __pycache__/
 *.pyc
 arxiv_ai_digest_projects/
 .env
-tests/
 
 # Artifacts
 docs/PLAN.md
