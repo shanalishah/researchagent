@@ -130,6 +130,60 @@ def get_corpus_dir() -> pathlib.Path:
     return local_dir
 
 
+def _check_corpus_freshness():
+    """Lightweight per-search freshness check that reloads data in-place without restart."""
+    import time
+    import boto3
+    from botocore.exceptions import ClientError
+
+    # 1. Throttle: check R2 at most every 30 minutes per session to save egress/API calls
+    now = time.time()
+    last_check = st.session_state.get("_freshness_checked_at", 0)
+    if now - last_check < 1800: # 1800s = 30 min
+        return
+
+    # 2. Get credentials
+    access_key = st.secrets.get("R2_ACCESS_KEY_ID") or os.environ.get("R2_ACCESS_KEY_ID")
+    secret_key = st.secrets.get("R2_SECRET_ACCESS_KEY") or os.environ.get("R2_SECRET_ACCESS_KEY")
+    endpoint = st.secrets.get("R2_ENDPOINT") or os.environ.get("R2_ENDPOINT")
+    bucket_name = st.secrets.get("R2_BUCKET") or os.environ.get("R2_BUCKET")
+
+    if not all([access_key, secret_key, endpoint, bucket_name]):
+        return
+
+    try:
+        s3 = boto3.client(
+            's3',
+            endpoint_url=endpoint,
+            aws_access_key_id=access_key,
+            aws_secret_access_key=secret_key,
+        )
+        
+        # 3. HEAD request to check ETag of the metadata file
+        response = s3.head_object(Bucket=bucket_name, Key="corpus/build_meta.json")
+        new_etag = response.get('ETag', '').strip('"')
+        old_etag = st.session_state.get("_corpus_etag")
+
+        if old_etag and new_etag == old_etag:
+            st.session_state["_freshness_checked_at"] = now
+            return
+
+        # 4. If ETag differs, refresh cached resources
+        if old_etag:
+            # We only show this if it's an actual update detected since session start
+            msg = st.info("New corpus data available — refreshing index (this takes ~20 seconds)...")
+            st.cache_resource.clear()
+            download_corpus_artifacts()
+            msg.empty()
+
+        st.session_state["_corpus_etag"] = new_etag
+        st.session_state["_freshness_checked_at"] = now
+
+    except Exception:
+        # Fail silently: data refresh is non-critical, we don't want to block the search
+        pass
+
+
 @st.cache_resource(show_spinner=False)
 def download_corpus_artifacts():
     """
@@ -1471,6 +1525,7 @@ def _main_body():
         run_clicked = st.button("🚀 Run Pipeline")
 
     if run_clicked:
+        _check_corpus_freshness()
         st.session_state["hide_pipeline_description"] = True
 
     hide_desc = st.session_state.get("hide_pipeline_description", False)
