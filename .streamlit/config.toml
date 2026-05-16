@@ -1,17 +1,15 @@
+[theme]
+base = "light"
+primaryColor = "#2B6B60"
+backgroundColor = "#FAF7F2"
+secondaryBackgroundColor = "#FFFFFF"
+textColor = "#1C3041"
+font = "sans serif"
+
 [server]
-# Maximize performance and avoid watcher spam
-folderWatchBlacklist = ["venv", ".venv", "tmp", "data", "corpus", "faiss_index"]
-fileWatcherType = "none"
+headless = true
+enableCORS = false
+enableXsrfProtection = true
 
 [browser]
 gatherUsageStats = false
-
-[client]
-showErrorDetails = true
-
-[theme]
-primaryColor = "#FF4B4B"
-backgroundColor = "#0E1117"
-secondaryBackgroundColor = "#262730"
-textColor = "#FAFAFA"
-font = "sans serif"
