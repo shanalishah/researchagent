@@ -122,6 +122,28 @@ def save_json(path: str, obj: Any):
         json.dump(obj, f, indent=2, default=str)
 
 
+def get_secret(name: str, default: str = "") -> str:
+    """
+    Safely load secrets in both Cloud Run and Streamlit Cloud.
+
+    Priority:
+    1. Environment variables, used by Cloud Run / local .env workflows
+    2. Streamlit secrets.toml, used by Streamlit Community Cloud
+    3. default
+
+    This prevents StreamlitSecretNotFoundError on Cloud Run when
+    .streamlit/secrets.toml does not exist.
+    """
+    value = os.getenv(name)
+    if value:
+        return str(value).strip().strip('\'"')
+
+    try:
+        return str(st.secrets.get(name, default)).strip().strip('\'"')
+    except Exception:
+        return default
+
+
 def get_corpus_dir() -> pathlib.Path:
     """
     Returns the writable directory for data pipeline artifacts.
@@ -153,11 +175,13 @@ def _check_corpus_freshness():
     if now - last_check < 1800: # 1800s = 30 min
         return
 
-    # 2. Get credentials
-    access_key = st.secrets.get("R2_ACCESS_KEY_ID") or os.environ.get("R2_ACCESS_KEY_ID")
-    secret_key = st.secrets.get("R2_SECRET_ACCESS_KEY") or os.environ.get("R2_SECRET_ACCESS_KEY")
-    endpoint = st.secrets.get("R2_ENDPOINT") or os.environ.get("R2_ENDPOINT")
-    bucket_name = st.secrets.get("R2_BUCKET") or os.environ.get("R2_BUCKET")
+    # 2. Get credentials.
+    # Cloud Run should provide these as environment variables, while
+    # Streamlit Community Cloud can still provide them through st.secrets.
+    access_key = get_secret("R2_ACCESS_KEY_ID")
+    secret_key = get_secret("R2_SECRET_ACCESS_KEY")
+    endpoint = get_secret("R2_ENDPOINT")
+    bucket_name = get_secret("R2_BUCKET")
 
     if not all([access_key, secret_key, endpoint, bucket_name]):
         return
@@ -211,11 +235,13 @@ def download_corpus_artifacts():
     import boto3
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
-    # 1. Resolve credentials: st.secrets (Streamlit Cloud) → os.getenv (.env / GitHub Actions)
-    key_id    = (st.secrets.get("R2_ACCESS_KEY_ID")     or os.getenv("R2_ACCESS_KEY_ID", "")).strip().strip('\'"')
-    access_key = (st.secrets.get("R2_SECRET_ACCESS_KEY") or os.getenv("R2_SECRET_ACCESS_KEY", "")).strip().strip('\'"')
-    endpoint   = (st.secrets.get("R2_ENDPOINT")          or os.getenv("R2_ENDPOINT", "")).strip().strip('\'"')
-    bucket     = (st.secrets.get("R2_BUCKET")            or os.getenv("R2_BUCKET", "")).strip().strip('\'"')
+    # 1. Resolve credentials.
+    # Cloud Run should provide these as environment variables, while
+    # Streamlit Community Cloud can still provide them through st.secrets.
+    key_id = get_secret("R2_ACCESS_KEY_ID")
+    access_key = get_secret("R2_SECRET_ACCESS_KEY")
+    endpoint = get_secret("R2_ENDPOINT")
+    bucket = get_secret("R2_BUCKET")
 
     if not all([key_id, access_key, endpoint, bucket]):
         st.warning("⚠️ R2 credentials not fully configured. Corpus sync skipped.")
@@ -1068,8 +1094,8 @@ def predict_citations_direct(target_papers: List[Paper], llm_config: LLMConfig, 
             with open("moneyball_weights.json", "r") as f: weights = json.load(f)
         except: pass
     
-    # Read S2 key from st.secrets (Streamlit Cloud) with os.getenv fallback (local/.env)
-    s2_key = st.secrets.get("S2_API_KEY") or os.getenv("S2_API_KEY")
+    # Read S2 key safely from Cloud Run env vars or Streamlit secrets.
+    s2_key = get_secret("S2_API_KEY")
     progress_bar = st.progress(0)
     
     for i, p in enumerate(target_papers):
