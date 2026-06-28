@@ -39,3 +39,8 @@ data_pipeline/corpus_smoke.db
 data_pipeline/bm25_index/
 data_pipeline/id_map.json
 logs/
+
+# Backend (FastAPI) — local venv, downloaded corpus cache, secrets
+.venv-backend/
+.corpus_cache/
+backend/.env

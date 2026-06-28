@@ -1,0 +1,19 @@
+# Backend (FastAPI + the extracted Research Agent pipeline).
+# Mirrors the app's requirements.txt minus Streamlit/pandas (UI-only),
+# plus the web server.
+fastapi>=0.115
+uvicorn[standard]>=0.30
+
+# Pipeline
+requests>=2.31.0
+feedparser>=6.0.10
+openai>=1.55.0
+sentence-transformers>=3.0.0
+google-genai>=0.3.0
+groq>=0.9.0
+faiss-cpu>=1.7.4
+bm25s>=0.2.0
+tenacity>=8.2.3
+boto3>=1.26.0
+scikit-learn>=1.3.0
+numpy>=1.24.0
